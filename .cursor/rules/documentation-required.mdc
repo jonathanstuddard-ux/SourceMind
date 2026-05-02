@@ -1,0 +1,25 @@
+---
+description: Require documentation whenever adding new functions or files
+alwaysApply: true
+---
+
+# Documentation for new code
+
+Whenever you **create a new file** or **add a new function, method, class, or exported constant**:
+
+## New files
+
+- Add a **short module-level block** at the top (after imports if the language prefers): what the file is for, who consumes it, and any non-obvious setup or env vars.
+- For **Next.js** routes (`page.tsx`, `layout.tsx`, `route.ts`): a brief comment block describing the route’s purpose and important data flow (APIs, server vs client).
+
+## New functions and methods
+
+- **TypeScript / TSX**: **JSDoc** on every new `export` and on non-trivial internal helpers. Include description, `@param` for non-obvious parameters, `@returns`, and `@throws` or error behavior when relevant.
+- **Python**: a **docstring** on new functions, methods, and public classes (`"""..."""`), with summary, `Args:`, `Returns:`, and `Raises:` when applicable.
+
+## Scope
+
+- Skip redundant docs only for trivial one-liners whose name and types are fully self-explanatory (e.g. `const clamp = (n, min, max) => ...` in a file that already documents the pattern).
+- Prefer updating **existing** module headers if you extend a file instead of duplicating the same overview.
+
+After edits, ensure new public surface is documented before considering the task done.

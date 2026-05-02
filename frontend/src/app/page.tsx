@@ -157,7 +157,8 @@ export default function Home() {
 
     try {
       const res = await fetch(
-        `${BACKEND_URL}/ingest/${encodeURIComponent(doc.filename)}`
+        `${BACKEND_URL}/ingest/${encodeURIComponent(doc.filename)}`,
+        { cache: "no-store" }
       );
       const data = await res.json();
       if (!res.ok) {
@@ -167,7 +168,11 @@ export default function Home() {
       if (data.status === "duplicate_skipped") {
         setStatus(data.message || "Already ingested.");
       } else {
-        setStatus(`Re-ingested ${data.chunks ?? 0} chunks for ${doc.original_filename}.`);
+        const ocr =
+          typeof data.ocr_mode === "string" ? ` (OCR mode: ${data.ocr_mode})` : "";
+        setStatus(
+          `Re-ingested ${data.chunks ?? 0} chunks for ${doc.original_filename}.${ocr}`
+        );
       }
       await fetchDocuments();
     } catch {
@@ -193,6 +198,34 @@ export default function Home() {
           ? "Using OpenAI cloud models."
           : "Add your OpenAI API key in the OpenAI Settings panel below to ask questions."
     );
+  }
+
+  /** Index a PDF already on disk into Qdrant (chunk + embed + upsert). */
+  async function ingestIntoKnowledgeBase(filename: string) {
+    setStatus("Processing PDF into SourceMind knowledge library...");
+    setAnswer("");
+    setCitations([]);
+
+    const res = await fetch(
+      `${BACKEND_URL}/ingest/${encodeURIComponent(filename)}`,
+      { cache: "no-store" }
+    );
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      setStatus(`Processing failed: ${data.detail || "Unknown error"}`);
+      return;
+    }
+
+    if (data.status === "duplicate_skipped") {
+      setStatus(data.message || "This PDF has already been processed.");
+    } else {
+      const ocr =
+        typeof data.ocr_mode === "string" ? ` (OCR mode: ${data.ocr_mode})` : "";
+      setStatus(`Processed ${data.chunks ?? 0} chunks into Qdrant.${ocr}`);
+    }
+    await fetchDocuments();
   }
 
   async function uploadPdf() {
@@ -224,11 +257,10 @@ export default function Home() {
 
       setUploadedFilename(data.saved_filename);
 
-      if (data.status === "duplicate") {
-        setStatus(data.message || "This PDF already exists in the knowledge library.");
-      } else {
-        setStatus(`Uploaded: ${data.saved_filename}`);
-      }
+      setStatus(
+        data.message ||
+          `Uploaded: ${data.saved_filename}. Click “Process into Knowledge Library” to index it in Qdrant.`
+      );
       await fetchDocuments();
     } catch {
       setStatus("Upload failed. Make sure the backend is running.");
@@ -244,28 +276,8 @@ export default function Home() {
     }
 
     setLoading(true);
-    setStatus("Processing PDF into SourceMind knowledge library...");
-    setAnswer("");
-    setCitations([]);
-
     try {
-      const res = await fetch(
-        `${BACKEND_URL}/ingest/${encodeURIComponent(uploadedFilename)}`
-      );
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        setStatus(`Processing failed: ${data.detail || "Unknown error"}`);
-        return;
-      }
-
-      if (data.status === "duplicate_skipped") {
-        setStatus(data.message || "This PDF has already been processed.");
-      } else {
-        setStatus(`Processed ${data.chunks ?? 0} chunks into Qdrant.`);
-      }
-      await fetchDocuments();
+      await ingestIntoKnowledgeBase(uploadedFilename);
     } catch {
       setStatus("Processing failed. Make sure Qdrant and the backend are running.");
     } finally {
@@ -446,6 +458,11 @@ export default function Home() {
         <section className="grid md:grid-cols-2 gap-6">
           <div className="rounded-2xl bg-slate-900 p-6 border border-slate-800">
             <h2 className="text-2xl font-semibold mb-4">1. Upload PDF</h2>
+            <p className="text-slate-400 text-sm mb-4">
+              Upload saves the PDF on the server only. Step 2 indexes it into
+              Qdrant (extract, chunk, embed). That keeps upload working even if
+              Qdrant was temporarily unavailable.
+            </p>
 
             <label className="mb-4 flex cursor-pointer items-center justify-center rounded-xl border border-dashed border-slate-600 bg-slate-800 px-4 py-8 text-center hover:bg-slate-700 transition">
               <span className="text-slate-200 break-all">
@@ -479,10 +496,11 @@ export default function Home() {
           </div>
 
           <div className="rounded-2xl bg-slate-900 p-6 border border-slate-800">
-            <h2 className="text-2xl font-semibold mb-4">2. Process PDF</h2>
+            <h2 className="text-2xl font-semibold mb-4">2. Process into Qdrant</h2>
             <p className="text-slate-300 mb-4">
-              SourceMind extracts text, cleans it, chunks it, creates embeddings
-              with FastEmbed, and stores vectors in Qdrant.
+              Run this after upload (or to re-index the last uploaded file):
+              extract text, chunk, embed with FastEmbed, and upsert into Qdrant.
+              Requires Qdrant to be running and reachable from the backend.
             </p>
 
             <button

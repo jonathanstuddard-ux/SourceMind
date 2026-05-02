@@ -10,6 +10,8 @@ RUN apt-get update \
         build-essential \
         curl \
         ca-certificates \
+        tesseract-ocr \
+        tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

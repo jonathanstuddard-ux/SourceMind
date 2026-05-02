@@ -13,7 +13,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from openai import OpenAI
 from pydantic import BaseModel
@@ -28,6 +27,8 @@ from qdrant_client.models import (
     FilterSelector,
 )
 from fastembed import TextEmbedding
+
+from app.pdf_ocr import OCR_MODE, extract_pdf_pages_for_indexing
 
 
 load_dotenv()
@@ -212,23 +213,9 @@ async def upload_pdf(file: UploadFile = File(...)):
     contents = await file.read()
     sha256 = file_hash(contents)
 
-    existing = qdrant_client.scroll(
-        collection_name=COLLECTION_NAME,
-        scroll_filter=duplicate_filter(sha256),
-        limit=1,
-        with_payload=True,
-        with_vectors=False,
-    )[0]
-
-    if existing:
-        payload = existing[0].payload or {}
-        return {
-            "status": "duplicate",
-            "saved_filename": payload.get("source_file"),
-            "file_sha256": sha256,
-            "message": "This PDF already exists in the knowledge library.",
-        }
-
+    # Upload only persists to disk. Do not require Qdrant here — a scroll before
+    # save used to fail the entire upload when Qdrant was down, so nothing was
+    # saved and "Process into Knowledge Library" had no file to ingest.
     document_id = str(uuid4())
     safe_filename = file.filename.replace(" ", "_")
     saved_filename = f"{document_id}_{safe_filename}"
@@ -237,11 +224,33 @@ async def upload_pdf(file: UploadFile = File(...)):
     with open(file_path, "wb") as f:
         f.write(contents)
 
+    already_indexed = False
+    try:
+        existing = qdrant_client.scroll(
+            collection_name=COLLECTION_NAME,
+            scroll_filter=duplicate_filter(sha256),
+            limit=1,
+            with_payload=True,
+            with_vectors=False,
+        )[0]
+        already_indexed = bool(existing)
+    except Exception:
+        pass
+
+    if already_indexed:
+        msg = (
+            "PDF saved on disk. The same content is already indexed in Qdrant; "
+            "ingest will skip until those vectors are removed from the library."
+        )
+    else:
+        msg = "PDF uploaded successfully. Use Process into Knowledge Library when you are ready to index it."
+
     return {
         "status": "uploaded",
         "saved_filename": saved_filename,
         "file_sha256": sha256,
-        "message": "PDF uploaded successfully.",
+        "already_indexed": already_indexed,
+        "message": msg,
     }
 
 
@@ -252,15 +261,10 @@ def extract_text(filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    loader = PyPDFLoader(str(file_path))
-    pages = loader.load()
+    page_rows = extract_pdf_pages_for_indexing(file_path)
+    extracted = [{"page": pn, "text": (txt or "")[:500]} for pn, txt in page_rows]
 
-    extracted = []
-
-    for i, page in enumerate(pages):
-        extracted.append({"page": i + 1, "text": page.page_content[:500]})
-
-    return {"filename": filename, "pages": len(pages), "preview": extracted}
+    return {"filename": filename, "pages": len(page_rows), "preview": extracted}
 
 
 @app.get("/ingest/{filename}")
@@ -288,15 +292,13 @@ def ingest_pdf(filename: str):
             "message": "This PDF has already been processed into Qdrant.",
         }
 
-    loader = PyPDFLoader(str(file_path))
-    pages = loader.load()
+    page_rows = extract_pdf_pages_for_indexing(file_path)
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     points = []
 
-    for page_index, page in enumerate(pages):
-        page_number = page_index + 1
-        cleaned = clean_text(page.page_content)
+    for page_number, raw_text in page_rows:
+        cleaned = clean_text(raw_text)
 
         if not cleaned:
             continue
@@ -325,6 +327,7 @@ def ingest_pdf(filename: str):
         "status": "stored_in_qdrant",
         "chunks": len(points),
         "file_sha256": sha256,
+        "ocr_mode": OCR_MODE,
     }
 
 

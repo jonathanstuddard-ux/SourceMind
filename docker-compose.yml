@@ -1,0 +1,52 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sourcemind-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+    container_name: sourcemind-backend
+    depends_on:
+      - qdrant
+    ports:
+      - "8000:8000"
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      # Ollama runs on the HOST machine (not in a container) so it can use Apple
+      # Silicon Metal / native CUDA. host.docker.internal points the container
+      # at the host. On Linux, the extra_hosts entry below makes that name work.
+      OLLAMA_URL: http://host.docker.internal:11434
+      # OPENAI_API_KEY is intentionally NOT set here. End users paste their own
+      # key into the OpenAI Settings panel in the UI; it is sent per-request as
+      # the X-OpenAI-Key header. You may set it here only for local development.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persist uploaded PDFs and the conversations.db across restarts.
+      - backend_data:/app/data
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # The browser, not the container, calls the backend. Use the host URL
+        # exposed by docker-compose (default http://localhost:8000).
+        NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://localhost:8000}
+    container_name: sourcemind-frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
+  backend_data:

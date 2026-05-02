@@ -1,0 +1,16 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+data
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+.DS_Store
+node_modules

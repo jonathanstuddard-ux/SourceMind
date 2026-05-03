@@ -767,10 +767,16 @@ Source chunks:
             )
 
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta.content
                 if delta:
                     accumulated.append(delta)
                     yield delta
+        except Exception as exc:
+            error_message = f"\n[OpenAI error: {exc}]"
+            accumulated.append(error_message)
+            yield error_message
         finally:
             log_conversation(
                 conversation_id=conversation_id,

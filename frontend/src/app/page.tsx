@@ -1,8 +1,13 @@
+/**
+ * SourceMind home UI: PDF upload/ingest, document library, OpenAI key panel,
+ * and streamed Q&A against the FastAPI backend (`ask-local-stream` /
+ * `ask-openai-stream`). Local models use llama.cpp (OpenAI-compatible `/v1`).
+ */
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
 
-type Provider = "ollama" | "openai";
+type Provider = "llamaedge" | "openai";
 
 type Citation = {
   source_number?: number;
@@ -21,18 +26,63 @@ type Document = {
   file_on_disk: boolean;
 };
 
-const BACKEND_URL =
-  process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8000";
+/** Local provider model row (values come from `/v1/models` or static fallback). */
+type LocalModelOption = { value: string; label: string };
+
+/** Backend origin for API calls; empty env would otherwise hit Next.js and 404. */
+const BACKEND_URL = (
+  process.env.NEXT_PUBLIC_BACKEND_URL?.trim() || "http://localhost:8000"
+).replace(/\/+$/, "");
 const OPENAI_KEY_STORAGE = "sourcemind.openaiKey";
 
-const ollamaModels = [
-  { value: "qwen3.5:4b", label: "qwen3.5:4b - Fast local model (installed)" },
-  { value: "gemma4:31b", label: "gemma4:31b - Large local model (installed)" },
-  { value: "qwen2.5:7b", label: "qwen2.5:7b - Strong local model" },
-  { value: "llama3.1:8b", label: "llama3.1:8b - Reliable local model" },
-  { value: "mistral:7b", label: "mistral:7b - Fast local model" },
-  { value: "gemma2:9b", label: "gemma2:9b - Balanced local model" },
-  { value: "phi3:medium", label: "phi3:medium - Lightweight local model" },
+/**
+ * Formats elapsed milliseconds for benchmark display in the UI.
+ *
+ * @param ms Elapsed time in milliseconds (`performance.now()` delta).
+ * @returns Short string, e.g. `842 ms` or `3.42 s`.
+ */
+function formatLatency(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  return `${(ms / 1000).toFixed(2)} s`;
+}
+
+/**
+ * Removes Qwen3 / llama.cpp "thinking" wrapper blocks from a completed answer so
+ * the UI shows only the assistant-visible text (benchmarks stay accurate).
+ *
+ * @param text Raw streamed body from the local OpenAI-compatible server.
+ * @returns Same text with common thinking fences removed and trimmed.
+ */
+function stripReasoningFromQwenOutput(text: string): string {
+  // Qwen3 via llama.cpp may wrap output in think fences (see docker compose --reasoning flags).
+  const thinkBlock = new RegExp(
+    "<think>[\\s\\S]*?<\\/think>",
+    "gi"
+  );
+  return text.replace(thinkBlock, "").trim();
+}
+
+/** Same id as `LLAMAEDGE_DEFAULT_CHAT_MODEL` / default GGUF in docker-compose. */
+const DEFAULT_LOCAL_MODEL_ID = "Qwen3-1.7B-Q8_0.gguf" as const;
+
+/**
+ * Picks the chat model id to select when switching to local or loading `/local-models`.
+ *
+ * @param options Dropdown options from the server (or the static fallback list).
+ * @returns `DEFAULT_LOCAL_MODEL_ID` when that id exists, otherwise the first option.
+ */
+function pickDefaultLocalModelId(options: LocalModelOption[]): string {
+  if (options.length === 0) return DEFAULT_LOCAL_MODEL_ID;
+  const preferred = options.find((o) => o.value === DEFAULT_LOCAL_MODEL_ID);
+  return preferred?.value ?? options[0].value;
+}
+
+/** Default chat ids when `/local-models` is unreachable or returns nothing. */
+const llamaedgeModelsFallback: LocalModelOption[] = [
+  {
+    value: DEFAULT_LOCAL_MODEL_ID,
+    label: "Qwen3-1.7B Q8_0 (docker: ./models/Qwen3-1.7B-Q8_0.gguf)",
+  },
 ];
 
 const openaiModels = [
@@ -44,8 +94,13 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [uploadedFilename, setUploadedFilename] = useState("");
   const [question, setQuestion] = useState("");
-  const [provider, setProvider] = useState<Provider>("ollama");
-  const [model, setModel] = useState("qwen3.5:4b");
+  const [provider, setProvider] = useState<Provider>("llamaedge");
+  const [model, setModel] = useState(() =>
+    pickDefaultLocalModelId(llamaedgeModelsFallback)
+  );
+  const [llamaedgeModelOptions, setLlamaedgeModelOptions] = useState<
+    LocalModelOption[]
+  >(llamaedgeModelsFallback);
   const [answer, setAnswer] = useState("");
   const [citations, setCitations] = useState<Citation[]>([]);
   const [status, setStatus] = useState("");
@@ -65,8 +120,11 @@ export default function Home() {
   const [showCorrection, setShowCorrection] = useState(false);
   const [savingFeedback, setSavingFeedback] = useState(false);
   const [feedbackPulse, setFeedbackPulse] = useState(false);
+  /** Elapsed time for the last completed streamed answer (benchmark); null if none or in-flight. */
+  const [lastResponseMs, setLastResponseMs] = useState<number | null>(null);
 
-  const modelOptions = provider === "ollama" ? ollamaModels : openaiModels;
+  const modelOptions =
+    provider === "llamaedge" ? llamaedgeModelOptions : openaiModels;
   const needsOpenaiKey = provider === "openai" && !openaiKeyStored;
 
   const fetchDocuments = useCallback(async () => {
@@ -101,6 +159,42 @@ export default function Home() {
       setOpenaiKey(stored);
       setOpenaiKeyStored(true);
     }
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/local-models`, {
+          cache: "no-store",
+        });
+        if (!res.ok || cancelled) return;
+        const data: unknown = await res.json();
+        if (cancelled || !data || typeof data !== "object") return;
+        const raw = (data as { models?: unknown }).models;
+        if (!Array.isArray(raw) || raw.length === 0) return;
+        const mapped: LocalModelOption[] = raw
+          .filter(
+            (m): m is { id: string } =>
+              !!m && typeof m === "object" && typeof (m as { id?: unknown }).id === "string"
+          )
+          .map((m) => ({
+            value: m.id,
+            label: m.id,
+          }));
+        if (mapped.length > 0) {
+          setLlamaedgeModelOptions(mapped);
+          setModel((prev) =>
+            mapped.some((o) => o.value === prev) ? prev : pickDefaultLocalModelId(mapped)
+          );
+        }
+      } catch {
+        /* keep fallback list */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   function saveOpenaiKey() {
@@ -184,7 +278,11 @@ export default function Home() {
 
   function handleProviderChange(nextProvider: Provider) {
     setProvider(nextProvider);
-    setModel(nextProvider === "ollama" ? "qwen3.5:4b" : "gpt-4o-mini");
+    setModel(
+      nextProvider === "llamaedge"
+        ? pickDefaultLocalModelId(llamaedgeModelOptions)
+        : "gpt-4o-mini"
+    );
     setAnswer("");
     setCitations([]);
     setConversationId(null);
@@ -192,8 +290,8 @@ export default function Home() {
     setShowCorrection(false);
     setCorrectionSaved(false);
     setStatus(
-      nextProvider === "ollama"
-        ? "Using local Ollama models."
+      nextProvider === "llamaedge"
+        ? "Using local llama.cpp (GGUF via OpenAI-compatible API)."
         : openaiKeyStored
           ? "Using OpenAI cloud models."
           : "Add your OpenAI API key in the OpenAI Settings panel below to ask questions."
@@ -299,8 +397,8 @@ export default function Home() {
 
     setLoading(true);
     setStatus(
-      provider === "ollama"
-        ? `SourceMind is streaming locally with ${model}...`
+      provider === "llamaedge"
+        ? `SourceMind is streaming locally (llama.cpp / ${model})...`
         : `SourceMind is streaming from OpenAI ${model}...`
     );
     setAnswer("");
@@ -310,6 +408,7 @@ export default function Home() {
     setShowCorrection(false);
     setCorrection("");
     setCorrectionSaved(false);
+    setLastResponseMs(null);
 
     try {
       const endpoint =
@@ -320,6 +419,7 @@ export default function Home() {
         headers["X-OpenAI-Key"] = openaiKey;
       }
 
+      const streamStart = performance.now();
       const res = await fetch(
         `${BACKEND_URL}/${endpoint}?question=${encodeURIComponent(
           question
@@ -330,11 +430,13 @@ export default function Home() {
       if (!res.ok) {
         const text = await res.text();
         setStatus(`Question failed: ${text || "Unknown error"}`);
+        setLastResponseMs(null);
         return;
       }
 
       if (!res.body) {
         setStatus("Streaming failed: no response body.");
+        setLastResponseMs(null);
         return;
       }
 
@@ -382,14 +484,20 @@ export default function Home() {
         setAnswer(streamedAnswer);
       }
 
+      streamedAnswer = stripReasoningFromQwenOutput(streamedAnswer);
+      setAnswer(streamedAnswer);
+
+      const elapsedMs = performance.now() - streamStart;
+      setLastResponseMs(elapsedMs);
       setStatus(
         `Answer streamed using ${
-          provider === "openai" ? "OpenAI" : "Ollama"
-        } / ${model}.`
+          provider === "openai" ? "OpenAI" : "llama.cpp"
+        } / ${model}. Response time: ${formatLatency(elapsedMs)} (request → stream end).`
       );
     } catch {
+      setLastResponseMs(null);
       setStatus(
-        "Question failed. Make sure Ollama/OpenAI, Qdrant, and backend are running."
+        "Question failed. Make sure the local LLM (llama.cpp), OpenAI, Qdrant, and backend are running."
       );
     } finally {
       setLoading(false);
@@ -450,7 +558,7 @@ export default function Home() {
           <h1 className="text-4xl md:text-5xl font-bold mt-3">SourceMind</h1>
           <p className="text-slate-300 text-lg max-w-3xl mt-3">
             Upload searchable PDFs, process them into a Qdrant-powered knowledge
-            library, and ask questions using either local Ollama models or OpenAI
+            library, and ask questions using either a local GGUF model (llama.cpp) or OpenAI
             cloud models with source citations.
           </p>
         </section>
@@ -619,7 +727,7 @@ export default function Home() {
           <p className="text-slate-400 text-sm mb-4">
             Your OpenAI API key is stored only in this browser&apos;s
             localStorage and sent to your backend as a request header. It is
-            never persisted on the server. Local Ollama models do not need a
+            never persisted on the server. Local GGUF / llama.cpp models do not need a
             key.
           </p>
 
@@ -686,7 +794,7 @@ export default function Home() {
             onChange={(e) => handleProviderChange(e.target.value as Provider)}
             className="mb-4 w-full rounded-xl bg-slate-800 border border-slate-700 p-3 text-white"
           >
-            <option value="ollama">Local Ollama</option>
+            <option value="llamaedge">Local model (llama.cpp)</option>
             <option value="openai">OpenAI Cloud</option>
           </select>
 
@@ -744,7 +852,17 @@ export default function Home() {
 
         {answer && (
           <section className="rounded-2xl bg-slate-900 p-6 border border-slate-800">
-            <h2 className="text-2xl font-semibold mb-4">Answer</h2>
+            <div className="flex flex-wrap items-baseline justify-between gap-2 mb-4">
+              <h2 className="text-2xl font-semibold">Answer</h2>
+              {lastResponseMs !== null && (
+                <p
+                  className="text-sm font-mono text-amber-300/90 tabular-nums"
+                  title="Browser timing: when fetch starts until the response stream finishes. Includes network, backend RAG, and model generation."
+                >
+                  Response time: {formatLatency(lastResponseMs)}
+                </p>
+              )}
+            </div>
             <div className="whitespace-pre-wrap text-slate-200 leading-7">
               {answer}
             </div>

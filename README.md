@@ -2,7 +2,7 @@
 
 A private, source-grounded RAG (Retrieval-Augmented Generation) knowledge
 system. Upload PDFs, ingest them into a local Qdrant vector database, and ask
-questions answered with citations using either local Ollama models or OpenAI
+questions answered with citations using either a **local GGUF** (llama.cpp) or OpenAI
 cloud models.
 
 - **Local-first.** PDFs and embeddings live on your machine in Qdrant.
@@ -11,8 +11,7 @@ cloud models.
 - **Streaming answers** with structured citations.
 - **Conversation logging** built in — feedback (`Yes` / `No` + corrections)
   is stored locally and exportable as fine-tuning data.
-- **One-command Docker deploy.** Ollama runs natively on the host so it can
-  use Apple Silicon Metal / native CUDA at full speed.
+- **One-command Docker deploy.** Local chat uses **llama.cpp** (`llama-server`) in Docker with your **GGUF** from `./models` (OpenAI-compatible `/v1` on host **9080** by default).
 
 ---
 
@@ -23,11 +22,11 @@ cloud models.
 │  Next.js UI  │ ──────────────────────▶ │   FastAPI    │ ──────────────────▶ │  Qdrant  │
 │ (browser)    │  X-OpenAI-Key header    │   backend    │                     │  (vec DB) │
 └──────────────┘                         │              │                     └──────────┘
-                                         │              │     POST /generate
-                                         │              │ ──────────────────▶ ┌──────────┐
-                                         │              │                     │  Ollama  │
-                                         │              │                     │ (host)   │
-                                         │              │     OpenAI HTTPS    └──────────┘
+                                         │              │  POST /v1/chat/completions
+                                         │              │ ──────────────────▶ ┌────────────┐
+                                         │              │                     │ llama.cpp  │
+                                         │              │                     │ (GGUF Svc) │
+                                         │              │     OpenAI HTTPS  └────────────┘
                                          │              │ ──────────────────▶ OpenAI cloud
                                          │              │
                                          │              │ ──▶ SQLite (conversations.db)
@@ -37,12 +36,12 @@ cloud models.
 - **Frontend:** Next.js 16 (React 19, Tailwind v4). Talks to the backend over
   HTTP, parses NDJSON-style streams (first line = JSON metadata header,
   remainder = answer text).
-- **Backend:** FastAPI + uvicorn. Streams answers from either Ollama or
-  OpenAI, attaches citations, logs every turn to SQLite for later
+- **Backend:** FastAPI + uvicorn. Streams answers from either the local llama.cpp
+  server or OpenAI, attaches citations, logs every turn to SQLite for later
   fine-tuning.
 - **Vector store:** Qdrant. Embeddings are computed locally with FastEmbed
   (`BAAI/bge-small-en-v1.5`, 384-dim cosine).
-- **LLM providers:** Ollama (host process) and OpenAI (per-request key).
+- **LLM providers:** Local **llama.cpp** server (GGUF in `./models`, OpenAI-compatible `/v1`) and OpenAI (per-request key).
 
 ---
 
@@ -50,48 +49,22 @@ cloud models.
 
 | Tool | Version | Purpose |
 |---|---|---|
-| Docker Desktop | 4.x+ | Runs Qdrant, backend, frontend |
-| Ollama | 0.3+ | Local LLM runtime (host install) |
+| Docker Desktop | 4.x+ | Runs Qdrant, local LLM (llama.cpp), backend, frontend |
 | Git | any | Cloning |
 | OpenAI API key | optional | Only if you want OpenAI models |
 
-> **Why Ollama on the host instead of in a container?** On macOS, Docker
-> containers cannot access Apple's Metal GPU. Running Ollama natively gives
-> you full GPU acceleration, and it works the same on Linux with NVIDIA. The
-> backend container reaches the host via `host.docker.internal`.
+> **Local LLM (llama.cpp):** Compose mounts `./models` read-only and starts
+> `ghcr.io/ggml-org/llama.cpp:server` with **`Qwen3-1.7B-Q8_0.gguf`** by default
+> (see `LLAMAEDGE_MODEL_GGUF`). Download that file into `./models/` first, or
+> point `LLAMAEDGE_MODEL_GGUF` at another GGUF path **inside** the container. For
+> NVIDIA on Linux/Windows, switch the image to `ghcr.io/ggml-org/llama.cpp:server-cuda`
+> and add GPU device reservations per [llama.cpp Docker docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#docker).
 
 ---
 
 ## Quick start (Docker, recommended)
 
-### 1. Install and start Ollama on the host
-
-```bash
-# macOS
-brew install ollama
-ollama serve &      # runs on http://localhost:11434
-
-# Linux
-curl -fsSL https://ollama.com/install.sh | sh
-sudo systemctl enable --now ollama
-```
-
-Pull at least one model (the smallest one is enough to start):
-
-```bash
-ollama pull qwen2.5:3b
-# Optional, larger / better:
-ollama pull qwen2.5:7b
-ollama pull llama3.1:8b
-```
-
-Verify it's reachable:
-
-```bash
-curl http://localhost:11434/api/tags
-```
-
-### 2. Clone and configure
+### 1. Clone and configure
 
 ```bash
 git clone <this-repo> sourcemind
@@ -99,23 +72,34 @@ cd sourcemind
 cp .env.example .env       # optional, defaults are fine for most users
 ```
 
-### 3. Bring up the stack
+### 1b. Put the default GGUF in `./models/`
+
+The stack expects **`models/Qwen3-1.7B-Q8_0.gguf`** (unless you override `LLAMAEDGE_MODEL_GGUF`). Example:
+
+```bash
+mkdir -p models
+curl -L -o models/Qwen3-1.7B-Q8_0.gguf \
+  "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf"
+```
+
+### 2. Bring up the stack
 
 ```bash
 docker compose up --build -d
 ```
 
-That builds and starts three containers:
+That builds and starts four containers:
 
-| Container | Port | Role |
+| Container | Host port(s) | Role |
 |---|---|---|
-| `sourcemind-qdrant`   | 6333  | Vector database |
-| `sourcemind-backend`  | 8000  | FastAPI + RAG logic |
-| `sourcemind-frontend` | 3000  | Next.js UI |
+| `sourcemind-qdrant`   | **6335** (HTTP), **6336** (gRPC) | Vector database (mapped off **6333** if another Qdrant already uses it) |
+| `sourcemind-llamaedge` | **9080** → 8080 | **llama.cpp** OpenAI-compatible chat (`llama-server`, GGUF from `./models`) |
+| `sourcemind-backend`  | **8000** | FastAPI + RAG logic |
+| `sourcemind-frontend` | **3000** | Next.js UI |
 
 Open <http://localhost:3000>.
 
-### 4. Use it
+### 3. Use it
 
 1. **Upload PDF** — choose a searchable PDF. Image-only scans won't work;
    OCR them first.
@@ -138,7 +122,10 @@ All configuration is environment-driven. See [`.env.example`](./.env.example).
 | Variable | Default | Where it lives | Purpose |
 |---|---|---|---|
 | `QDRANT_URL` | `http://localhost:6333` | backend | Vector DB endpoint |
-| `OLLAMA_URL` | `http://localhost:11434` | backend | Ollama endpoint. In Docker compose this is overridden to `http://host.docker.internal:11434`. |
+| `LLAMAEDGE_BASE_URL` | `http://localhost:9080` | backend | Local OpenAI-compatible **API root only** — do **not** include `/v1`. In Compose the backend uses `http://llamaedge:8080`. From the **host** (venv backend + stack in Docker), use `http://localhost:9080` for the default publish. |
+| `LLAMAEDGE_MODEL_GGUF` | `/models/Qwen3-1.7B-Q8_0.gguf` | compose | Path **inside** the llamaedge container to the GGUF file (left side of `./models:/models`). |
+| `LLAMAEDGE_API_KEY` | `not-needed` | backend | Placeholder for the OpenAI SDK; local llama.cpp ignores it. |
+| `LLAMAEDGE_DEFAULT_CHAT_MODEL` | `Qwen3-1.7B-Q8_0.gguf` | backend | Default `model` query param and `/local-models` fallback; must match your GGUF id from `GET /v1/models`. Set in Compose for Docker. |
 | `OPENAI_API_KEY` | unset | backend (dev only) | Optional fallback. Production users should leave this empty and supply their key from the UI. |
 | `NEXT_PUBLIC_BACKEND_URL` | `http://localhost:8000` | frontend (build-time) | URL the browser uses to reach the backend |
 
@@ -161,6 +148,7 @@ All configuration is environment-driven. See [`.env.example`](./.env.example).
 docker compose logs -f backend
 docker compose logs -f frontend
 docker compose logs -f qdrant
+docker compose logs -f llamaedge   # llama.cpp server
 ```
 
 ### Stop / restart
@@ -202,15 +190,12 @@ curl 'http://localhost:8000/export-training-data?format=text' \
   -o training_data_text.jsonl
 ```
 
-### Update an Ollama model
+### Swap the local GGUF model
 
-```bash
-ollama pull qwen2.5:7b
-```
-
-The backend picks up new models automatically — they appear in the model
-dropdown when you set `provider = ollama` (the dropdown is a static list
-right now; you can edit `frontend/src/app/page.tsx` to add more).
+1. Place the new `.gguf` under **`./models/`** (or another host folder you mount at `/models`).
+2. Set **`LLAMAEDGE_MODEL_GGUF`** in `.env` to the **in-container** path, e.g. `/models/MyModel-Q4_K_M.gguf`.
+3. Optionally set **`LLAMAEDGE_DEFAULT_CHAT_MODEL`** to the id returned by `GET http://localhost:9080/v1/models` (often the GGUF filename).
+4. `docker compose up -d --force-recreate llamaedge backend` so the server reloads the weights.
 
 ---
 
@@ -226,7 +211,7 @@ python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# Optional: drop a backend/.env with QDRANT_URL / OLLAMA_URL overrides.
+# Optional: drop a backend/.env with QDRANT_URL / LLAMAEDGE_BASE_URL overrides.
 # DO NOT commit your .env. The .gitignore already excludes it.
 
 # Make sure Qdrant is running. Easiest way:
@@ -259,7 +244,8 @@ npm run dev    # http://localhost:3000
 | `GET  /documents` | List indexed documents |
 | `DELETE /documents/{filename}` | Remove a document's chunks (keeps PDF) |
 | `GET  /search?question=` | Top-k retrieval, no LLM |
-| `GET  /ask-local-stream?question=&model=` | Streamed answer from Ollama |
+| `GET  /local-models` | Chat model ids from the local server (`GET /v1/models`) for the UI |
+| `GET  /ask-local-stream?question=&model=` | Streamed answer from local llama.cpp (OpenAI chat completions) |
 | `GET  /ask-openai-stream?question=&model=` | Streamed answer from OpenAI. Requires `X-OpenAI-Key` header (or `OPENAI_API_KEY` env) |
 | `POST /feedback/{conversation_id}` | `{"feedback":"up"\|"down","correction":"..."}` |
 | `GET  /conversations?limit=` | Recent logged turns |
@@ -290,7 +276,7 @@ cd backend && source .venv/bin/activate
 backend/.venv/bin/uvicorn app.main:app --reload
 ```
 
-### "Address already in use" on port 8000 / 3000 / 6333
+### "Address already in use" on port 8000 / 3000 / 6333 / 9080
 
 Something else is bound to that port. Find and kill it:
 
@@ -298,29 +284,31 @@ Something else is bound to that port. Find and kill it:
 lsof -ti:8000 | xargs kill -9
 ```
 
-### Ollama answers "I cannot verify that from the uploaded sources"
+### Local (GGUF) answers "I cannot verify that from the uploaded sources"
 
 That's the safety rail kicking in. Either:
 - The PDF wasn't ingested (check the Document Library section in the UI), or
 - The retrieval found nothing relevant — try rephrasing, or upload more
   documents.
 
-### Backend can't reach Ollama from inside Docker
+### Backend can't reach the local LLM from inside Docker
 
-Confirm it's running on the **host**:
-
-```bash
-curl http://localhost:11434/api/tags
-```
-
-…and that the backend container can reach it:
+Confirm the llamaedge container is healthy and the API responds:
 
 ```bash
-docker exec sourcemind-backend curl -s http://host.docker.internal:11434/api/tags
+curl -s http://localhost:9080/v1/models
 ```
 
-On Linux this requires the `extra_hosts: host.docker.internal:host-gateway`
-entry (already in `docker-compose.yml`).
+From inside the backend container (same Compose network):
+
+```bash
+docker exec sourcemind-backend python -c "import urllib.request; print(urllib.request.urlopen('http://llamaedge:8080/v1/models').read()[:200])"
+```
+
+If you point `LLAMAEDGE_BASE_URL` at a **host**-bound llama.cpp server instead, use
+`http://host.docker.internal:<port>` — the `extra_hosts:
+host.docker.internal:host-gateway` entry is already in `docker-compose.yml` for
+Linux.
 
 ### "OpenAI API key required"
 
@@ -343,8 +331,9 @@ the named volume).
 
 ## Privacy & security
 
-- **No telemetry.** Nothing is sent to a third party except the OpenAI calls
-  that you explicitly trigger.
+- **No telemetry.** Nothing is sent to a third party except the OpenAI **cloud**
+  calls that you explicitly trigger. Local llama.cpp traffic stays on your
+  machine / Docker network.
 - **OpenAI keys are never persisted server-side.** They live in
   `localStorage` and are sent only as a per-request header.
 - **Conversation logs are local.** They live in

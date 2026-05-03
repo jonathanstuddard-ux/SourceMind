@@ -2,11 +2,45 @@ services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: sourcemind-qdrant
+    # Host ports default to 6335/6336 so this stack can run alongside another
+    # Qdrant already bound to 6333–6334 (e.g. an older container). The backend
+    # still reaches Qdrant at http://qdrant:6333 on the Docker network.
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "6335:6333"
+      - "6336:6334"
     volumes:
       - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  # OpenAI-compatible HTTP API (llama.cpp llama-server) serving the mounted
+  # GGUF. Default: Qwen3 1.7B Q8_0 from ./models — download first (see README).
+  # Host port 9080 avoids clashing with other apps using localhost:8080.
+  llamaedge:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: sourcemind-llamaedge
+    ports:
+      - "9080:8080"
+    volumes:
+      - ./models:/models:ro
+    command:
+      - "-m"
+      - "${LLAMAEDGE_MODEL_GGUF:-/models/Qwen3-1.7B-Q8_0.gguf}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8080"
+      - "--jinja"
+      # Qwen3 thinking: keep final text in message.content for the OpenAI SDK.
+      - "--reasoning-format"
+      - "none"
+      - "--reasoning"
+      - "off"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
     restart: unless-stopped
 
   backend:
@@ -14,18 +48,23 @@ services:
       context: ./backend
     container_name: sourcemind-backend
     depends_on:
-      - qdrant
+      qdrant:
+        condition: service_started
+      llamaedge:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
       QDRANT_URL: http://qdrant:6333
-      # Ollama runs on the HOST machine (not in a container) so it can use Apple
-      # Silicon Metal / native CUDA. host.docker.internal points the container
-      # at the host. On Linux, the extra_hosts entry below makes that name work.
-      OLLAMA_URL: http://host.docker.internal:11434
+      # Backend reaches llama.cpp on the Compose network (OpenAI-compatible /v1).
+      LLAMAEDGE_BASE_URL: http://llamaedge:8080
+      # Must match the GGUF filename reported by GET /v1/models (default Qwen3 1.7B).
+      LLAMAEDGE_DEFAULT_CHAT_MODEL: Qwen3-1.7B-Q8_0.gguf
       # OPENAI_API_KEY is intentionally NOT set here. End users paste their own
       # key into the OpenAI Settings panel in the UI; it is sent per-request as
       # the X-OpenAI-Key header. You may set it here only for local development.
+    # Lets you point LLAMAEDGE_BASE_URL at llama.cpp on the host
+    # (e.g. http://host.docker.internal:9080) if you run it outside Compose.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

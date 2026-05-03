@@ -35,6 +35,9 @@ Thumbs.db
 .vscode/
 .idea/
 
+# Local GGUF / model weights (large files)
+models/*.gguf
+
 # Docker
 *.pid
 qdrant_storage/

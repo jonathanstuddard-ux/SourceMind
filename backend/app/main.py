@@ -1,3 +1,13 @@
+"""SourceMind FastAPI backend: PDF ingest, Qdrant RAG, local llama.cpp + OpenAI.
+
+Consumes: Next.js UI via HTTP. Depends on Qdrant, a local OpenAI-compatible
+``/v1`` server (Compose service ``llamaedge``, typically llama.cpp), and optionally
+OpenAI cloud.
+
+Notable env vars: ``QDRANT_URL``, ``LLAMAEDGE_BASE_URL`` (no ``/v1`` suffix),
+``LLAMAEDGE_API_KEY`` (optional), ``LLAMAEDGE_DEFAULT_CHAT_MODEL``.
+"""
+
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -7,7 +17,6 @@ import json
 import os
 import re
 import sqlite3
-import requests
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header
@@ -50,7 +59,37 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+
+
+def _normalize_llamaedge_base_url(raw: str) -> str:
+    """Strip trailing slashes and a mistaken ``/v1`` suffix from the API root.
+
+    ``make_llamaedge_client`` appends ``/v1`` itself. If ``LLAMAEDGE_BASE_URL``
+    is set to ``http://host:8080/v1`` (common after copying OpenAI examples),
+    requests would hit ``.../v1/v1/chat/completions`` and return 404 / URL not found.
+
+    Args:
+        raw: Value of ``LLAMAEDGE_BASE_URL`` from the environment.
+
+    Returns:
+        Normalized origin, e.g. ``http://llamaedge:8080``.
+    """
+    u = raw.strip().rstrip("/")
+    while u.endswith("/v1"):
+        u = u[:-3].rstrip("/")
+    return u or "http://localhost:9080"
+
+
+LLAMAEDGE_BASE_URL = _normalize_llamaedge_base_url(
+    # Default host port matches docker-compose publish 9080:8080 for llama.cpp.
+    os.getenv("LLAMAEDGE_BASE_URL", "http://localhost:9080")
+)
+LLAMAEDGE_API_KEY = os.getenv("LLAMAEDGE_API_KEY", "not-needed")
+# Default GGUF id aligned with docker-compose (`Qwen3-1.7B-Q8_0.gguf` in ./models).
+_DEFAULT_LOCAL_CHAT_MODEL = "Qwen3-1.7B-Q8_0.gguf"
+DEFAULT_LLAMAEDGE_CHAT_MODEL = os.getenv(
+    "LLAMAEDGE_DEFAULT_CHAT_MODEL", _DEFAULT_LOCAL_CHAT_MODEL
+)
 CONVERSATIONS_DB = DATA_DIR / "conversations.db"
 COLLECTION_NAME = "sourcemind_knowledge"
 
@@ -71,6 +110,54 @@ def make_openai_client(api_key: Optional[str]) -> OpenAI:
             ),
         )
     return OpenAI(api_key=key)
+
+
+def make_llamaedge_client() -> OpenAI:
+    """Build an OpenAI SDK client pointed at the local OpenAI-compatible ``/v1`` API.
+
+    llama.cpp ignores the API key; a placeholder is still sent because the OpenAI
+    client requires a string.
+
+    Returns:
+        An ``OpenAI`` client with ``base_url`` set to ``<LLAMAEDGE_BASE_URL>/v1``.
+    """
+    return OpenAI(
+        base_url=f"{LLAMAEDGE_BASE_URL}/v1",
+        api_key=LLAMAEDGE_API_KEY or "not-needed",
+        timeout=300.0,
+    )
+
+
+SOURCE_GROUNDED_SYSTEM_PROMPT = """
+You are a source-grounded research assistant.
+
+Rules:
+1. Answer only using the provided source chunks.
+2. If the chunks do not support the answer, say: "I cannot verify that from the uploaded sources."
+3. Cite every important claim using [Source 1], [Source 2], etc.
+4. Do not invent sources.
+5. Be clear, concise, and structured.
+""".strip()
+
+# Qwen3 + llama.cpp may emit `` ... `` blocks; strip before logging (matches UI cleanup).
+_THINK_OPEN = "<" + "think" + ">"
+_THINK_CLOSE = "<" + "/" + "think" + ">"
+_QWEN_THINK_FENCE = re.compile(
+    re.escape(_THINK_OPEN) + r"[\s\S]*?" + re.escape(_THINK_CLOSE),
+    re.IGNORECASE,
+)
+
+
+def _strip_qwen_think_fences(text: str) -> str:
+    """Remove llama.cpp Qwen3 think-fence blocks from a completed answer string.
+
+    Args:
+        text: Raw model output.
+
+    Returns:
+        Text with think fences removed and outer whitespace trimmed.
+    """
+    return _QWEN_THINK_FENCE.sub("", text).strip()
 
 
 def init_conversations_db():
@@ -461,14 +548,50 @@ def search_knowledge_library(question: str):
     return {"question": question, "matches": matches}
 
 
+@app.get("/local-models")
+def list_local_models():
+    """List chat model ids from the local ``/v1`` server for the SourceMind dropdown.
+
+    Proxies ``GET /v1/models``. On failure, returns a single fallback id from
+    ``LLAMAEDGE_DEFAULT_CHAT_MODEL`` so the UI still works if discovery is down.
+
+    Returns:
+        JSON ``{"models": [{"id": str, "label": str}, ...]}``.
+    """
+    fallback = {
+        "models": [
+            {
+                "id": DEFAULT_LLAMAEDGE_CHAT_MODEL,
+                "label": (
+                    f"{DEFAULT_LLAMAEDGE_CHAT_MODEL} "
+                    "(fallback — start llama.cpp / set LLAMAEDGE_DEFAULT_CHAT_MODEL)"
+                ),
+            }
+        ]
+    }
+    try:
+        client = make_llamaedge_client()
+        page = client.models.list()
+        models = [{"id": m.id, "label": m.id} for m in page.data]
+        if not models:
+            return fallback
+        # Put the configured default first so UIs that pick the first id stay aligned.
+        models.sort(
+            key=lambda d: (0 if d["id"] == DEFAULT_LLAMAEDGE_CHAT_MODEL else 1, d["id"])
+        )
+        return {"models": models}
+    except Exception:
+        return fallback
+
+
 @app.get("/ask-local")
-def ask_local(question: str, model: str = "qwen3.5:4b"):
+def ask_local(question: str, model: str = DEFAULT_LLAMAEDGE_CHAT_MODEL):
     results = retrieve_sources(question)
 
     if not results:
         return {
             "question": question,
-            "provider": "ollama",
+            "provider": "llamaedge",
             "model_used": model,
             "answer": "I cannot verify that from the uploaded sources.",
             "citations": [],
@@ -476,15 +599,7 @@ def ask_local(question: str, model: str = "qwen3.5:4b"):
 
     context, citations = build_source_context(results)
 
-    prompt = f"""
-You are a source-grounded research assistant.
-
-Rules:
-- Answer only using the provided source chunks.
-- If the chunks do not support the answer, say: I cannot verify that from the uploaded sources.
-- Cite every important claim using [Source 1], [Source 2], etc.
-- Do not invent sources.
-
+    user_prompt = f"""
 Question:
 {question}
 
@@ -492,20 +607,31 @@ Source chunks:
 {context}
 """
 
-    response = requests.post(
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": model, "prompt": prompt, "stream": False},
-        timeout=300,
-    )
-
-    if response.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Ollama error: {response.text}")
+    try:
+        client = make_llamaedge_client()
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SOURCE_GROUNDED_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+            stream=False,
+        )
+        choice = completion.choices[0].message.content
+        answer_text = choice if isinstance(choice, str) else (choice or "")
+        answer_text = _strip_qwen_think_fences(answer_text or "")
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Local LLM error: {exc}",
+        ) from exc
 
     return {
         "question": question,
-        "provider": "ollama",
+        "provider": "llamaedge",
         "model_used": model,
-        "answer": response.json().get("response", ""),
+        "answer": answer_text,
         "citations": citations,
     }
 
@@ -521,7 +647,7 @@ def stream_header(citations: list, conversation_id: str) -> str:
 
 
 @app.get("/ask-local-stream")
-def ask_local_stream(question: str, model: str = "qwen3.5:4b"):
+def ask_local_stream(question: str, model: str = DEFAULT_LLAMAEDGE_CHAT_MODEL):
     results = retrieve_sources(question)
     conversation_id = str(uuid4())
 
@@ -533,7 +659,7 @@ def ask_local_stream(question: str, model: str = "qwen3.5:4b"):
             log_conversation(
                 conversation_id=conversation_id,
                 question=question,
-                provider="ollama",
+                provider="llamaedge",
                 model=model,
                 citations=[],
                 answer=answer,
@@ -542,16 +668,7 @@ def ask_local_stream(question: str, model: str = "qwen3.5:4b"):
 
     context, citations = build_source_context(results)
 
-    prompt = f"""
-You are a source-grounded research assistant.
-
-Rules:
-- Answer only using the provided source chunks.
-- If the chunks do not support the answer, say: I cannot verify that from the uploaded sources.
-- Cite every important claim using [Source 1], [Source 2], etc.
-- Do not invent sources.
-- Be clear, concise, and structured.
-
+    user_prompt = f"""
 Question:
 {question}
 
@@ -564,41 +681,36 @@ Source chunks:
         accumulated: list[str] = []
 
         try:
-            with requests.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": model, "prompt": prompt, "stream": True},
+            client = make_llamaedge_client()
+            stream = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SOURCE_GROUNDED_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
                 stream=True,
-                timeout=300,
-            ) as response:
-                if response.status_code != 200:
-                    error_message = f"\n[Ollama error: {response.text}]"
-                    accumulated.append(error_message)
-                    yield error_message
-                    return
+            )
 
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line:
-                        continue
-                    try:
-                        data = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-
-                    token = data.get("response", "")
-                    if token:
-                        accumulated.append(token)
-                        yield token
-
-                    if data.get("done"):
-                        break
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content
+                if delta:
+                    accumulated.append(delta)
+                    yield delta
+        except Exception as exc:
+            error_message = f"\n[Local LLM error: {exc}]"
+            accumulated.append(error_message)
+            yield error_message
         finally:
             log_conversation(
                 conversation_id=conversation_id,
                 question=question,
-                provider="ollama",
+                provider="llamaedge",
                 model=model,
                 citations=citations,
-                answer="".join(accumulated),
+                answer=_strip_qwen_think_fences("".join(accumulated)),
             )
 
     return StreamingResponse(generate(), media_type="text/plain")
@@ -631,17 +743,6 @@ def ask_openai_stream(
 
     context, citations = build_source_context(results)
 
-    system_prompt = """
-You are a source-grounded research assistant.
-
-Rules:
-1. Answer only using the provided source chunks.
-2. If the chunks do not support the answer, say: "I cannot verify that from the uploaded sources."
-3. Cite every important claim using [Source 1], [Source 2], etc.
-4. Do not invent sources.
-5. Be clear, concise, and structured.
-"""
-
     user_prompt = f"""
 Question:
 {question}
@@ -658,7 +759,7 @@ Source chunks:
             stream = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system_prompt},
+                    {"role": "system", "content": SOURCE_GROUNDED_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.2,

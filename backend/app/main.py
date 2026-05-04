@@ -2,7 +2,8 @@
 
 Consumes: Next.js UI via HTTP. Depends on Qdrant, a local OpenAI-compatible
 ``/v1`` server (Compose service ``llamaedge``, typically llama.cpp), and optionally
-OpenAI cloud.
+OpenAI cloud. PDF ingest splits page text with tiktoken (``cl100k_base``) into
+500-token windows with 100-token overlap before embedding.
 
 Notable env vars: ``QDRANT_URL``, ``LLAMAEDGE_BASE_URL`` (no ``/v1`` suffix),
 ``LLAMAEDGE_API_KEY`` (optional), ``LLAMAEDGE_DEFAULT_CHAT_MODEL``.
@@ -96,6 +97,15 @@ COLLECTION_NAME = "sourcemind_knowledge"
 qdrant_client = QdrantClient(url=QDRANT_URL)
 embedding_model = TextEmbedding()
 VECTOR_SIZE = 384
+
+# Ingest chunking: token counts via tiktoken (aligned with common OpenAI-style estimates).
+CHUNK_SIZE_TOKENS = 500
+CHUNK_OVERLAP_TOKENS = 100
+INGEST_TEXT_SPLITTER = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name="cl100k_base",
+    chunk_size=CHUNK_SIZE_TOKENS,
+    chunk_overlap=CHUNK_OVERLAP_TOKENS,
+)
 
 
 def make_openai_client(api_key: Optional[str]) -> OpenAI:
@@ -381,7 +391,6 @@ def ingest_pdf(filename: str):
 
     page_rows = extract_pdf_pages_for_indexing(file_path)
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     points = []
 
     for page_number, raw_text in page_rows:
@@ -390,7 +399,7 @@ def ingest_pdf(filename: str):
         if not cleaned:
             continue
 
-        chunks = splitter.split_text(cleaned)
+        chunks = INGEST_TEXT_SPLITTER.split_text(cleaned)
         vectors = list(embedding_model.embed(chunks))
 
         for i, chunk in enumerate(chunks):

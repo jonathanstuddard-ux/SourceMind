@@ -103,7 +103,8 @@ Open <http://localhost:3000>.
 
 1. **Upload PDF** — choose a searchable PDF. Image-only scans won't work;
    OCR them first.
-2. **Process PDF** — extracts text, splits into ~1k-character chunks,
+2. **Process PDF** — extracts text, splits into 500-token chunks (100-token overlap,
+   tiktoken `cl100k_base`),
    embeds, stores in Qdrant. Duplicate uploads are detected by SHA-256.
 3. **Document Library** — see what's indexed; re-ingest or delete chunks
    without losing the original PDF.
